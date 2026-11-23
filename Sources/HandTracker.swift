@@ -76,6 +76,8 @@ final class HandTracker: NSObject, ObservableObject {
     private var orientation: UIInterfaceOrientation = .portrait
     /// Ligado/desligado pelo menu (Mãos e Controles).
     var handsEnabled = true
+    /// 1 ou 2 — quantas mãos são detectadas ao mesmo tempo (Mãos e Controles > Número de mãos).
+    private(set) var maxHands: Int
 
     override init() {
         let saved = UserDefaults.standard.string(forKey: "hand_camera") ?? HandCamera.front.rawValue
@@ -83,7 +85,36 @@ final class HandTracker: NSObject, ObservableObject {
         if cam.device() == nil { cam = .front }
         camera = cam
         activeCamera = cam
+        let savedHands = UserDefaults.standard.integer(forKey: "max_hands")
+        maxHands = savedHands == 1 ? 1 : 2
         super.init()
+    }
+
+    /// Troca entre rastrear 1 ou 2 mãos. Recria só o detector do MediaPipe (a câmera continua rodando).
+    func setMaxHands(_ n: Int) {
+        let clamped = n <= 1 ? 1 : 2
+        guard clamped != maxHands else { return }
+        maxHands = clamped
+        UserDefaults.standard.set(clamped, forKey: "max_hands")
+        guard configured else { return }
+        queue.async { [weak self] in
+            guard let self = self, let modelPath = Bundle.main.path(forResource: "hand_landmarker", ofType: "task") else { return }
+            do {
+                let options = HandLandmarkerOptions()
+                options.baseOptions.modelAssetPath = modelPath
+                options.runningMode = .liveStream
+                options.numHands = clamped
+                options.minHandDetectionConfidence = 0.5
+                options.minHandPresenceConfidence = 0.5
+                options.minTrackingConfidence = 0.5
+                options.handLandmarkerLiveStreamDelegate = self
+                self.landmarker = try HandLandmarker(options: options)
+                self.lock.lock(); self.latest = []; self.lock.unlock()
+                self.smoothed.removeAll(); self.pinchState.removeAll()
+            } catch {
+                self.setStatus("erro no MediaPipe: \(error.localizedDescription)")
+            }
+        }
     }
 
     func start() {
