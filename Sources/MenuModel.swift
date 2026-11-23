@@ -52,6 +52,7 @@ enum PressKind {
     case web(CGPoint)                // pinça sobre a página web: vira clique se não arrastar
     case webScroll                   // arrastar a página web
     case grab                        // mover o menu
+    case resize                      // redimensionar o menu pela borda
     case pendingTap(String, CGPoint) // botão dentro da lista: vira clique só se não arrastar
 }
 
@@ -118,6 +119,14 @@ final class MenuModel: ObservableObject {
     @Published var handTracking: Bool {
         didSet { UserDefaults.standard.set(handTracking, forKey: "hand_tracking"); app?.applyPrefs() }
     }
+    /// 1 ou 2 mãos rastreadas ao mesmo tempo.
+    @Published var maxHands: Int {
+        didSet { UserDefaults.standard.set(maxHands, forKey: "max_hands"); app?.applyPrefs() }
+    }
+    /// Tamanho do painel do menu, ajustado arrastando a borda (como no PC). 1.0 = tamanho padrão.
+    @Published var panelScale: CGFloat {
+        didSet { UserDefaults.standard.set(Double(panelScale), forKey: "panel_scale") }
+    }
     @Published var volume: Double {
         didSet { UserDefaults.standard.set(volume, forKey: "volume"); app?.applyPrefs() }
     }
@@ -137,6 +146,7 @@ final class MenuModel: ObservableObject {
     var viewportHeight: CGFloat = 0
 
     private var dragBase: CGSize?
+    private var resizeBase: CGFloat?
     private var touchScrollBase: CGFloat?
     private var toastWork: DispatchWorkItem?
     private var timer: Timer?
@@ -154,6 +164,8 @@ final class MenuModel: ObservableObject {
         envSounds = flag("env_sounds", true)
         hoverSounds = flag("hover_sounds", true)
         handTracking = flag("hand_tracking", true)
+        maxHands = d.object(forKey: "max_hands") == nil ? 2 : (d.integer(forKey: "max_hands") == 1 ? 1 : 2)
+        panelScale = CGFloat(d.object(forKey: "panel_scale") == nil ? 1.0 : min(max(d.double(forKey: "panel_scale"), 0.75), 1.5))
         volume = d.object(forKey: "volume") == nil ? 0.8 : d.double(forKey: "volume")
         textScaleIdx = d.integer(forKey: "text_scale")
         homeEnv = d.string(forKey: "home_env") ?? "desert"
@@ -436,6 +448,9 @@ final class MenuModel: ObservableObject {
                 vrShiftIdx = max(0, min(4, Int(a.dropFirst(6)) ?? 2))
             } else if a.hasPrefix("text:") {
                 textScaleIdx = Int(a.dropFirst(5)) ?? 0
+            } else if a.hasPrefix("hands:") {
+                maxHands = Int(a.dropFirst(6)) == 1 ? 1 : 2
+                showToast(maxHands == 1 ? "Rastreando 1 mão" : "Rastreando 2 mãos")
             } else if a.hasPrefix("app:") {
                 openLibraryApp(String(a.dropFirst(4)))
             }
@@ -536,6 +551,19 @@ final class MenuModel: ObservableObject {
 
     func endTouchDragMenu() { dragBase = nil }
 
+    // MARK: - redimensionar o menu (arrastar pela borda, como no PC)
+
+    private func clampScale(_ s: CGFloat) -> CGFloat { min(max(s, 0.75), 1.5) }
+
+    func touchResizeMenu(_ translation: CGSize) {
+        if resizeBase == nil { resizeBase = panelScale }
+        let base = resizeBase ?? 1.0
+        let d = (translation.width + translation.height) / 2   // arrastar p/ baixo-direita aumenta, p/ cima-esquerda diminui
+        panelScale = clampScale(base + d / 220)
+    }
+
+    func endTouchResizeMenu() { resizeBase = nil }
+
     // MARK: - entrada por pinça
 
     func hitTest(_ p: CGPoint) -> String? {
@@ -559,7 +587,7 @@ final class MenuModel: ObservableObject {
         var found: String?
         if let p = p, let id = hitTest(p) {
             let n = id.hasPrefix("s:") ? String(id.dropFirst(2)) : id
-            if n.hasPrefix("b:") || n.hasPrefix("sl:") || n == "g:grab" { found = id }
+            if n.hasPrefix("b:") || n.hasPrefix("sl:") || n == "g:grab" || n == "g:resize" { found = id }
         }
         if found != hoverId {
             hoverId = found
@@ -581,6 +609,7 @@ final class MenuModel: ObservableObject {
             return .slider(id)
         }
         if n == "g:grab" { return .grab }
+        if n == "g:resize" { return .resize }
         if id == "p:web" { return .web(p) }
         if id == "p:scroll" { return .scroll }
         return .blocked
@@ -594,6 +623,8 @@ final class MenuModel: ObservableObject {
             scrollBy(-delta.y)
         case .grab:
             offset = clampOffset(CGSize(width: offset.width + delta.x, height: offset.height + delta.y))
+        case .resize:
+            panelScale = clampScale(panelScale + (delta.x + delta.y) / 2 / 220)
         case .web(let start):
             let dx = p.x - start.x
             let dy = p.y - start.y
