@@ -4,6 +4,7 @@ import Network
 
 enum MenuPage: Hashable {
     case quick, settings, environments, system, personal, hands, access, storage, about
+    case files, share, notifs, profile, privacy, library
 
     var title: String {
         switch self {
@@ -16,8 +17,19 @@ enum MenuPage: Hashable {
         case .access: return "Acessibilidade"
         case .storage: return "Armazenamento"
         case .about: return "Sobre"
+        case .files: return "Arquivos"
+        case .share: return "Compartilhar"
+        case .notifs: return "Notificações"
+        case .profile: return "Perfil"
+        case .privacy: return "Privacidade"
+        case .library: return "Apps"
         }
     }
+}
+
+/// Janelas de aplicativo que ficam no lugar do painel de páginas.
+enum AppWindow {
+    case browser, viewer
 }
 
 struct PointerDot: Identifiable {
@@ -37,6 +49,8 @@ enum PressKind {
     case blocked                     // pinça sobre o painel, sem efeito
     case slider(String)              // arrastar um controle deslizante (id bruto)
     case scroll                      // rolar a lista
+    case web(CGPoint)                // pinça sobre a página web: vira clique se não arrastar
+    case webScroll                   // arrastar a página web
     case grab                        // mover o menu
     case pendingTap(String, CGPoint) // botão dentro da lista: vira clique só se não arrastar
 }
@@ -77,6 +91,11 @@ final class MenuModel: ObservableObject {
     @Published var scroll: CGFloat = 0
     @Published var toast: String?
     @Published var loadingEnv: String?
+    @Published var window: AppWindow?
+    @Published var profileName: String {
+        didSet { UserDefaults.standard.set(profileName, forKey: "profile_name") }
+    }
+    @Published var profilePhoto: UIImage?
 
     // estado do sistema
     @Published var now = Date()
@@ -105,6 +124,12 @@ final class MenuModel: ObservableObject {
     @Published var textScaleIdx: Int { didSet { UserDefaults.standard.set(textScaleIdx, forKey: "text_scale") } }
     @Published var homeEnv: String { didSet { UserDefaults.standard.set(homeEnv, forKey: "home_env") } }
     @Published var brightness: Double
+    /// Separação das duas imagens do modo VR (0...4, 2 = padrão; maior = imagens mais juntas).
+    @Published var vrShiftIdx: Int {
+        didSet { UserDefaults.standard.set(vrShiftIdx, forKey: "vr_shift") }
+    }
+    /// Passthrough: mostra a câmera no lugar do ambiente virtual (não é salvo).
+    @Published var passthrough = false
 
     // posições dos alvos (preenchido pelo SwiftUI; não precisa redesenhar nada)
     var frames: [String: CGRect] = [:]
@@ -133,11 +158,35 @@ final class MenuModel: ObservableObject {
         textScaleIdx = d.integer(forKey: "text_scale")
         homeEnv = d.string(forKey: "home_env") ?? "desert"
         brightness = Double(UIScreen.main.brightness)
+        vrShiftIdx = d.object(forKey: "vr_shift") == nil ? 2 : max(0, min(4, d.integer(forKey: "vr_shift")))
+        profileName = d.string(forKey: "profile_name") ?? ""
+        profilePhoto = UIImage(contentsOfFile: MenuModel.profilePhotoURL.path)
+    }
+
+    // MARK: - perfil
+
+    static var profilePhotoURL: URL {
+        return MediaModel.docs.appendingPathComponent("profile.jpg")
+    }
+
+    func setProfilePhoto(_ img: UIImage?) {
+        if let img = img, let data = img.jpegData(compressionQuality: 0.85) {
+            try? data.write(to: MenuModel.profilePhotoURL)
+            profilePhoto = img
+        } else {
+            try? FileManager.default.removeItem(at: MenuModel.profilePhotoURL)
+            profilePhoto = nil
+        }
     }
 
     // MARK: - aparência
 
     var theme: Theme { return themeLight ? Theme.light : Theme.dark }
+
+    /// Deslocamento de cada imagem do VR, em fração da largura da tela (positivo = aproxima as imagens).
+    var vrShiftFraction: Float {
+        return Float(vrShiftIdx - 2) * 0.012
+    }
 
     var ts: CGFloat {
         let scales: [CGFloat] = [1.0, 1.15, 1.3]
@@ -220,6 +269,25 @@ final class MenuModel: ObservableObject {
         scroll = 0
     }
 
+    func close() {
+        isOpen = false
+        stack = []
+        scroll = 0
+    }
+
+    func openBrowser() {
+        stack = []
+        scroll = 0
+        isOpen = true
+        if window == .browser {
+            window = nil
+            app?.keyboard.close()
+        } else {
+            window = .browser
+            app?.browser.ensureTab()
+        }
+    }
+
     func show(_ page: MenuPage) {
         if stack == [page] {
             stack = []
@@ -249,6 +317,12 @@ final class MenuModel: ObservableObject {
         case "storage": push(.storage)
         case "about": push(.about)
         case "envs": push(.environments)
+        case "files": push(.files)
+        case "share": push(.share)
+        case "notifs": push(.notifs)
+        case "profile": push(.profile)
+        case "privacy": push(.privacy)
+        case "library": push(.library)
         default: break
         }
     }
@@ -269,13 +343,55 @@ final class MenuModel: ObservableObject {
         if id.hasPrefix("s:") { id.removeFirst(2) }
         guard id.hasPrefix("b:") else { return }
         let a = String(id.dropFirst(2))
-        app?.audio.play("sfx_press")
+
+        // teclado virtual: som próprio, não passa pelo clique padrão
+        if a.hasPrefix("key:") {
+            app?.keyboard.press(String(a.dropFirst(4)))
+            return
+        }
+        app?.audio.play(a.hasPrefix("web:") || a.hasPrefix("view:") ? "ui_general_keypress_01" : "sfx_press")
+
+        if a.hasPrefix("web:") {
+            app?.browser.action(String(a.dropFirst(4)))
+            return
+        }
+        if a.hasPrefix("file:") {
+            app?.media.action(String(a.dropFirst(5)))
+            return
+        }
+        if a.hasPrefix("view:") {
+            app?.media.viewerAction(String(a.dropFirst(5)))
+            return
+        }
         switch a {
         case "toggle": toggleMenu()
         case "quick": show(.quick)
         case "envs": show(.environments)
         case "settings": show(.settings)
         case "about": show(.about)
+        case "files":
+            show(.files)
+            app?.media.refresh()
+        case "share": show(.share)
+        case "notifs": show(.notifs)
+        case "apps": show(.library)
+        case "browser": openBrowser()
+        case "win:close":
+            if window == .viewer { app?.media.stopPlayer() }
+            window = nil
+            app?.keyboard.close()
+        case "cap:photo": app?.capture.takePhoto()
+        case "cap:video": app?.capture.toggleRecording()
+        case "notif:clear": app?.notifs.clear()
+        case "profile:name":
+            app?.keyboard.open(.name, initial: profileName)
+        case "profile:photo":
+            app?.picker = PickerRequest(kind: .profile)
+        case "profile:remove":
+            setProfilePhoto(nil)
+        case "welcome":
+            UserDefaults.standard.set(true, forKey: "welcomed")
+            app?.showWelcome = false
         case "back": back()
         case "close":
             stack = []
@@ -290,6 +406,15 @@ final class MenuModel: ObservableObject {
         case "tog:envsounds": envSounds.toggle()
         case "tog:hover": hoverSounds.toggle()
         case "tog:hands": handTracking.toggle()
+        case "tog:passthrough":
+            passthrough.toggle()
+            showToast(passthrough ? "Passthrough ligado" : "Passthrough desligado")
+        case "tog:vr": app?.toggleVR()
+        case "tog:vrflip":
+            app?.vrFlip.toggle()
+            showToast("Orientação do VR invertida")
+        case "cast":
+            showToast(app?.cast.active == true ? "Tela sendo transmitida" : "Use a Central de Controle > Espelhar tela")
         case "theme:dark": themeLight = false
         case "theme:light": themeLight = true
         case "wifi": showToast(wifi ? "Wi-Fi conectado" : "Wi-Fi desconectado")
@@ -302,8 +427,41 @@ final class MenuModel: ObservableObject {
                 pushCard(String(a.dropFirst(5)))
             } else if a.hasPrefix("env:") {
                 selectEnv(String(a.dropFirst(4)))
+            } else if a.hasPrefix("cam:") {
+                if let cam = HandCamera(rawValue: String(a.dropFirst(4))) {
+                    app?.tracker.selectCamera(cam)
+                    showToast(cam.title)
+                }
+            } else if a.hasPrefix("vrsep:") {
+                vrShiftIdx = max(0, min(4, Int(a.dropFirst(6)) ?? 2))
             } else if a.hasPrefix("text:") {
                 textScaleIdx = Int(a.dropFirst(5)) ?? 0
+            } else if a.hasPrefix("app:") {
+                openLibraryApp(String(a.dropFirst(4)))
+            }
+        }
+    }
+
+    /// Abre um atalho da biblioteca: app do iOS (URL scheme), página no navegador do Metulas ou favorito.
+    func openLibraryApp(_ key: String) {
+        var target: String?
+        if key.hasPrefix("bm:") {
+            let i = Int(key.dropFirst(3)) ?? -1
+            let list = app?.browser.bookmarks ?? []
+            if i >= 0 && i < list.count && list[i].count > 1 { target = "web:" + list[i][1] }
+        } else {
+            target = AppLibrary.apps.first(where: { $0.id == key })?.url
+        }
+        guard let t = target else { return }
+        if t.hasPrefix("web:") {
+            stack = []
+            scroll = 0
+            isOpen = true
+            window = .browser
+            app?.browser.newTab(String(t.dropFirst(4)))
+        } else if let u = URL(string: t) {
+            UIApplication.shared.open(u, options: [:]) { [weak self] ok in
+                if !ok { self?.showToast("Não foi possível abrir") }
             }
         }
     }
@@ -339,6 +497,8 @@ final class MenuModel: ObservableObject {
             let v = max(0.05, f)
             brightness = v
             UIScreen.main.brightness = CGFloat(v)
+        case "sl:seek":
+            app?.media.seek(f)
         default:
             break
         }
@@ -421,6 +581,7 @@ final class MenuModel: ObservableObject {
             return .slider(id)
         }
         if n == "g:grab" { return .grab }
+        if id == "p:web" { return .web(p) }
         if id == "p:scroll" { return .scroll }
         return .blocked
     }
@@ -433,6 +594,15 @@ final class MenuModel: ObservableObject {
             scrollBy(-delta.y)
         case .grab:
             offset = clampOffset(CGSize(width: offset.width + delta.x, height: offset.height + delta.y))
+        case .web(let start):
+            let dx = p.x - start.x
+            let dy = p.y - start.y
+            if sqrt(dx * dx + dy * dy) > 16 {
+                app?.browser.scrollBy(dx: -delta.x, dy: -delta.y)
+                return .webScroll
+            }
+        case .webScroll:
+            app?.browser.scrollBy(dx: -delta.x, dy: -delta.y)
         case .pendingTap(_, let start):
             let dx = p.x - start.x
             let dy = p.y - start.y
@@ -448,6 +618,7 @@ final class MenuModel: ObservableObject {
 
     func pressEnded(_ kind: PressKind) {
         if case .pendingTap(let id, _) = kind { activate(id) }
+        if case .web(let p) = kind { app?.browser.tap(atGlobal: p) }
     }
 
     private func setSlider(_ rawId: String, at p: CGPoint) {

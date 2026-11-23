@@ -1,4 +1,5 @@
 import CoreMotion
+import UIKit
 import simd
 
 /// Giroscópio -> rotação da câmera virtual (espaço da cena: Y para cima, -Z para frente).
@@ -7,6 +8,8 @@ final class MotionController {
     private var headingZero: Float = 0
     private var needsRecenter = true
     var enabled = true
+    /// Orientação atual da interface (retrato no modo normal, paisagem no modo VR).
+    var interfaceOrientation: UIInterfaceOrientation = .portrait
 
     func start() {
         guard manager.isDeviceMotionAvailable else { return }
@@ -36,7 +39,24 @@ final class MotionController {
             SIMD3<Float>(0, 0, 1),
             SIMD3<Float>(0, -1, 0)
         ])
-        let cam = refToScene * deviceToRef
+        // eixos da tela (direita, cima, trás) em coordenadas do aparelho
+        var right = SIMD3<Float>(1, 0, 0)
+        var up = SIMD3<Float>(0, 1, 0)
+        switch interfaceOrientation {
+        case .landscapeRight:
+            right = SIMD3<Float>(0, -1, 0)
+            up = SIMD3<Float>(1, 0, 0)
+        case .landscapeLeft:
+            right = SIMD3<Float>(0, 1, 0)
+            up = SIMD3<Float>(-1, 0, 0)
+        case .portraitUpsideDown:
+            right = SIMD3<Float>(-1, 0, 0)
+            up = SIMD3<Float>(0, -1, 0)
+        default:
+            break
+        }
+        let screen = simd_float3x3(columns: (right, up, SIMD3<Float>(0, 0, 1)))
+        let cam = refToScene * deviceToRef * screen
         if needsRecenter {
             let f = cam * SIMD3<Float>(0, 0, -1)
             if abs(f.x) + abs(f.z) > 0.15 {

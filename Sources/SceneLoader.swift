@@ -24,6 +24,28 @@ struct MaterialInfo {
 struct SceneDraw {
     let mesh: Int
     let world: simd_float4x4
+    let node: Int
+}
+
+/// Esqueleto: nós das juntas e matrizes bind inversas (formato V40S, seção de skins).
+struct SkinInfo {
+    var joints: [Int]
+    var ibm: [simd_float4x4]
+}
+
+/// Canal de animação de um nó. path 0 = translação (3 floats), 1 = rotação quaternion xyzw (4 floats).
+struct AnimChannel {
+    let node: Int
+    let path: Int
+    let times: [Float]
+    let values: [Float]
+}
+
+/// Dados por vértice de uma malha com skin: posição+uv de repouso, 4 juntas e 4 pesos.
+struct SkinSource {
+    var base: [Float]      // vc * 5 (x y z u v)
+    var joints: [UInt8]    // vc * 4
+    var weights: [Float]   // vc * 4
 }
 
 final class LoadedScene {
@@ -32,6 +54,17 @@ final class LoadedScene {
     var textureNames: [String] = []
     var draws: [SceneDraw] = []
     var radius: Float = 0
+
+    // hierarquia e animação
+    var nodeParent: [Int] = []
+    var nodeT: [SIMD3<Float>] = []
+    var nodeQ: [SIMD4<Float>] = []
+    var nodeS: [SIMD3<Float>] = []
+    var nodeSkin: [Int] = []
+    var skins: [SkinInfo] = []
+    var channels: [AnimChannel] = []
+    var duration: Float = 0
+    var skinSources: [Int: SkinSource] = [:]   // índice da malha -> dados de skin
 }
 
 /// Formato "V40S" v2 (scene.bin):
@@ -61,6 +94,22 @@ enum SceneLoader {
 
         mutating func f32() throws -> Float {
             return Float(bitPattern: try u32())
+        }
+
+        mutating func floats(_ n: Int) throws -> [Float] {
+            guard n >= 0, offset + n * 4 <= data.count else { throw SceneError.truncated }
+            var out = [Float](repeating: 0, count: n)
+            let start = offset
+            let bytes = n * 4
+            if bytes > 0 {
+                out.withUnsafeMutableBytes { dst in
+                    data.withUnsafeBytes { src in
+                        dst.copyMemory(from: UnsafeRawBufferPointer(rebasing: src[start..<(start + bytes)]))
+                    }
+                }
+            }
+            offset += bytes
+            return out
         }
 
         mutating func skip(_ n: Int) throws {
@@ -94,6 +143,7 @@ enum SceneLoader {
             var parent: Int
             var local: simd_float4x4
             var mesh: Int
+            var skin: Int
         }
         var nodes: [Node] = []
         nodes.reserveCapacity(nodeCount)
@@ -103,8 +153,13 @@ enum SceneLoader {
             let q = SIMD4<Float>(try r.f32(), try r.f32(), try r.f32(), try r.f32())
             let s = SIMD3<Float>(try r.f32(), try r.f32(), try r.f32())
             let mesh = Int(try r.i32())
-            _ = try r.i32() // skin
-            nodes.append(Node(parent: parent, local: simd_float4x4.trs(t: p, q: q, s: s), mesh: mesh))
+            let skin = Int(try r.i32())
+            nodes.append(Node(parent: parent, local: simd_float4x4.trs(t: p, q: q, s: s), mesh: mesh, skin: skin))
+            scene.nodeParent.append(parent)
+            scene.nodeT.append(p)
+            scene.nodeQ.append(q)
+            scene.nodeS.append(s)
+            scene.nodeSkin.append(skin)
         }
 
         let meshCount = Int(try r.u32())
@@ -149,6 +204,28 @@ enum SceneLoader {
                 return true
             }
 
+            if vstride == 52 && indicesOK {
+                // 32 bytes por vértice depois de pos+uv: 4 índices de junta (float) e 4 pesos (float)
+                var src = SkinSource(base: [Float](repeating: 0, count: vc * 5),
+                                     joints: [UInt8](repeating: 0, count: vc * 4),
+                                     weights: [Float](repeating: 0, count: vc * 4))
+                let baseOff = r.offset
+                data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                    for i in 0..<vc {
+                        let o = baseOff + i * 52
+                        for k in 0..<5 {
+                            src.base[i * 5 + k] = Float(bitPattern: raw.loadUnaligned(fromByteOffset: o + k * 4, as: UInt32.self))
+                        }
+                        for k in 0..<4 {
+                            let jf = Float(bitPattern: raw.loadUnaligned(fromByteOffset: o + 20 + k * 4, as: UInt32.self))
+                            src.joints[i * 4 + k] = jf.isFinite ? UInt8(max(0, min(255, jf))) : 0
+                            src.weights[i * 4 + k] = Float(bitPattern: raw.loadUnaligned(fromByteOffset: o + 36 + k * 4, as: UInt32.self))
+                        }
+                    }
+                }
+                scene.skinSources[scene.meshes.count] = src
+            }
+
             try r.skip(vc * vstride + ibytes)
             scene.meshes.append(MeshGPU(vertexBuffer: vbuf, indexBuffer: ibuf,
                                         indexCount: indicesOK ? ic : 0, material: material))
@@ -168,6 +245,54 @@ enum SceneLoader {
             scene.textureNames.append(try r.string(len))
         }
 
+        // Seções opcionais no fim do arquivo: skins e canais de animação (se faltar ou estiver truncado, a cena fica estática).
+        if r.offset + 4 <= data.count {
+            do {
+                var skins: [SkinInfo] = []
+                let skinCount = Int(try r.u32())
+                for _ in 0..<skinCount {
+                    let jc = Int(try r.u32())
+                    var joints: [Int] = []
+                    var ibm: [simd_float4x4] = []
+                    for _ in 0..<jc {
+                        joints.append(Int(try r.u32()))
+                        let f = try r.floats(16)
+                        ibm.append(simd_float4x4(columns: (
+                            SIMD4<Float>(f[0], f[1], f[2], f[3]),
+                            SIMD4<Float>(f[4], f[5], f[6], f[7]),
+                            SIMD4<Float>(f[8], f[9], f[10], f[11]),
+                            SIMD4<Float>(f[12], f[13], f[14], f[15]))))
+                    }
+                    skins.append(SkinInfo(joints: joints, ibm: ibm))
+                }
+                var channels: [AnimChannel] = []
+                var duration: Float = 0
+                let chCount = Int(try r.u32())
+                for _ in 0..<chCount {
+                    let node = Int(try r.u32())
+                    let path = Int(try r.u32())
+                    _ = try r.u32()            // interpolação (0 = linear)
+                    let dur = try r.f32()
+                    let n = Int(try r.u32())
+                    let comps = path == 1 ? 4 : 3
+                    guard path == 0 || path == 1 || path == 2, n > 0 else { throw SceneError.truncated }
+                    let times = try r.floats(n)
+                    let values = try r.floats(n * comps)
+                    duration = max(duration, dur)
+                    if path != 2 {
+                        channels.append(AnimChannel(node: node, path: path, times: times, values: values))
+                    }
+                }
+                scene.skins = skins
+                scene.channels = channels
+                scene.duration = duration
+            } catch {
+                scene.skins = []
+                scene.channels = []
+                scene.skinSources = [:]
+            }
+        }
+
         var world = [simd_float4x4](repeating: matrix_identity_float4x4, count: nodes.count)
         for (i, n) in nodes.enumerated() {
             if n.parent >= 0 && n.parent < i {
@@ -176,7 +301,7 @@ enum SceneLoader {
                 world[i] = n.local
             }
             if n.mesh >= 0 && n.mesh < scene.meshes.count {
-                scene.draws.append(SceneDraw(mesh: n.mesh, world: world[i]))
+                scene.draws.append(SceneDraw(mesh: n.mesh, world: world[i], node: i))
             }
         }
         return scene

@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>New Tab</title>
+<style>
+  html, body { margin: 0; background: #1c1e21; color: #e4e6eb; font-family: sans-serif; }
+  .wrap { padding: 28px 36px; }
+  h2 { font-size: 22px; font-weight: 600; margin: 8px 0 18px; }
+  .row { display: flex; flex-wrap: wrap; gap: 22px; margin-bottom: 30px; }
+  .site { width: 84px; text-align: center; text-decoration: none; color: #e4e6eb; font-size: 13px; }
+  .site .ic { width: 64px; height: 64px; margin: 0 auto 8px; border-radius: 50%; background: #3a3b3c;
+              display: flex; align-items: center; justify-content: center; }
+  .site img { width: 36px; height: 36px; }
+  .cards { display: flex; gap: 18px; flex-wrap: wrap; }
+  .card { width: 250px; background: #242526; border-radius: 10px; overflow: hidden; text-decoration: none; color: #e4e6eb; }
+  .card .top { height: 120px; display: flex; align-items: center; justify-content: center; font-size: 34px; font-weight: 700; }
+  .card .t { padding: 10px 12px 2px; font-size: 15px; font-weight: 600; }
+  .card .s { padding: 0 12px 12px; font-size: 12px; color: #b0b3b8; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Popular</h2>
+  <div class="row" id="popular"></div>
+  <h2>From the Web</h2>
+  <div class="cards">
+    <a class="card" href="https://www.youtube.com/"><div class="top" style="background:#c4302b">YouTube</div><div class="t">YouTube</div><div class="s">Watch videos, including 360 and VR</div></a>
+    <a class="card" href="https://www.twitch.tv/"><div class="top" style="background:#6441a5">Twitch</div><div class="t">Twitch</div><div class="s">Live streams from games and creators</div></a>
+    <a class="card" href="https://www.wikipedia.org/"><div class="top" style="background:#54595d">Wikipedia</div><div class="t">Wikipedia</div><div class="s">The free encyclopedia</div></a>
+  </div>
+</div>
+<script>
+  var sites = [["Oculus", "www.oculus.com"], ["Facebook", "www.facebook.com"], ["Instagram", "www.instagram.com"],
+               ["Messenger", "www.messenger.com"], ["YouTube", "www.youtube.com"], ["Twitch", "www.twitch.tv"],
+               ["ESPN", "www.espn.com"], ["Google", "www.google.com"], ["Twitter", "twitter.com"]];
+  var row = document.getElementById("popular");
+  sites.forEach(function (s) {
+    var a = document.createElement("a");
+    a.className = "site";
+    a.href = "https://" + s[1] + "/";
+    a.innerHTML = '<div class="ic"><img src="https://' + s[1] + '/favicon.ico" onerror="this.style.display=\'none\'"></div>' + s[0];
+    row.appendChild(a);
+  });
+</script>
+</body>
+</html>

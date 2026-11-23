@@ -45,6 +45,9 @@ targets:
       - path: Resources/sfx
         type: folder
         buildPhase: resources
+      - path: Resources/browser
+        type: folder
+        buildPhase: resources
       - path: Resources/hand_landmarker.task
         buildPhase: resources
     info:
@@ -53,10 +56,14 @@ targets:
         CFBundleDisplayName: Metulas
         UILaunchScreen: {}
         UIRequiredDeviceCapabilities: [arm64, metal]
-        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UIRequiresFullScreen: true
         UIStatusBarHidden: true
         UIViewControllerBasedStatusBarAppearance: false
-        NSCameraUsageDescription: "A câmera é usada para rastrear suas mãos."
+        NSCameraUsageDescription: "A câmera (frontal ou traseira) é usada para rastrear suas mãos e para o passthrough."
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSPhotoLibraryAddUsageDescription: "Salvar fotos e vídeos capturados no Metulas."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.metulas.desert

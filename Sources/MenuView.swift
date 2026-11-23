@@ -49,42 +49,107 @@ struct HoverFX: ViewModifier {
 struct MenuOverlay: View {
     @ObservedObject var menu: MenuModel
     @ObservedObject var app: AppModel
+    @ObservedObject var keyboard: KeyboardModel
+    @ObservedObject var browser: BrowserModel
+    /// No modo VR existem duas cópias do menu (uma por olho); só a primeira registra os alvos da pinça.
+    var registersFrames: Bool = true
+    var vr: Bool = false
 
     var body: some View {
         GeometryReader { geo in
             content(geo.size)
         }
         .onPreferenceChange(FrameKey.self) { f in
-            menu.frames = f
+            if registersFrames { menu.frames = f }
         }
     }
 
+    private func panelWidth(_ size: CGSize) -> CGFloat {
+        return vr ? min(size.width - 70, 330) : min(size.width - 20, 380)
+    }
+
+    private func panelHeight(_ size: CGSize) -> CGFloat {
+        return vr ? min(size.height * 0.62, 300) : min(size.height * 0.56, 480)
+    }
+
+    private func windowHeight(_ size: CGSize) -> CGFloat {
+        if keyboard.isOpen { return max(vr ? 150 : 190, size.height * 0.3) }
+        if menu.window == .browser && browser.theater { return vr ? min(size.height * 0.7, 320) : min(size.height * 0.72, 640) }
+        return panelHeight(size)
+    }
+
     private func content(_ size: CGSize) -> some View {
-        let w = min(size.width - 20, 380)
+        let w = panelWidth(size)
         let theme = menu.theme
-        return VStack(spacing: 10) {
-            Spacer(minLength: 0)
-            if let page = menu.stack.last {
-                MainPanel(menu: menu, app: app, page: page, theme: theme)
-                    .frame(width: w, height: min(size.height * 0.56, 480))
-                    .transition(AnyTransition.scale(scale: 0.94).combined(with: .opacity))
-            }
-            if menu.isOpen {
-                VStack(spacing: 6) {
-                    DockBar(menu: menu, theme: theme)
-                    GrabHandle(menu: menu, theme: theme)
+        return ZStack {
+            VStack(spacing: 10) {
+                Spacer(minLength: 0)
+                if let page = menu.stack.last {
+                    MainPanel(menu: menu, app: app, page: page, theme: theme)
+                        .frame(width: w, height: panelHeight(size))
+                        .transition(AnyTransition.scale(scale: 0.94).combined(with: .opacity))
+                } else if menu.window == .browser {
+                    BrowserWindow(menu: menu, app: app, browser: browser, kb: keyboard, theme: theme)
+                        .frame(width: w, height: windowHeight(size))
+                } else if menu.window == .viewer {
+                    ViewerWindow(menu: menu, media: app.media, theme: theme)
+                        .frame(width: w, height: windowHeight(size))
                 }
-                .frame(width: w)
-                .transition(AnyTransition.move(edge: .bottom).combined(with: .opacity))
-            } else {
-                OpenButton(menu: menu)
+                if keyboard.isOpen {
+                    KeyboardPanel(menu: menu, kb: keyboard, theme: theme)
+                        .frame(width: w)
+                        .transition(AnyTransition.move(edge: .bottom).combined(with: .opacity))
+                }
+                if menu.isOpen {
+                    VStack(spacing: 6) {
+                        DockBar(menu: menu, app: app, theme: theme)
+                        GrabHandle(menu: menu, theme: theme)
+                    }
+                    .frame(width: w)
+                    .transition(AnyTransition.move(edge: .bottom).combined(with: .opacity))
+                } else {
+                    OpenButton(menu: menu)
+                }
+            }
+            .padding(.bottom, 34)
+            .frame(width: size.width, height: size.height)
+            .offset(menu.offset)
+            .animation(.easeOut(duration: 0.2), value: menu.stack)
+            .animation(.easeOut(duration: 0.2), value: menu.isOpen)
+            .animation(.easeOut(duration: 0.2), value: menu.window)
+            .animation(.easeOut(duration: 0.2), value: keyboard.isOpen)
+
+            if vr {
+                VStack {
+                    VRExitPill(menu: menu, theme: theme)
+                        .padding(.top, 14)
+                    Spacer()
+                }
+            }
+
+            if app.showWelcome && !app.booting {
+                WelcomeCard(menu: menu, theme: theme)
+                    .transition(.opacity)
+            }
+            if app.booting {
+                BootSplash()
+                    .transition(.opacity)
             }
         }
-        .padding(.bottom, 34)
         .frame(width: size.width, height: size.height)
-        .offset(menu.offset)
-        .animation(.easeOut(duration: 0.2), value: menu.stack)
-        .animation(.easeOut(duration: 0.2), value: menu.isOpen)
+    }
+}
+
+struct NotifDot: View {
+    @ObservedObject var notifs: NotificationsModel
+    let color: Color
+
+    var body: some View {
+        Group {
+            if notifs.unread > 0 {
+                Circle().fill(color).frame(width: 10, height: 10)
+            }
+        }
     }
 }
 
@@ -112,6 +177,7 @@ struct OpenButton: View {
 
 struct DockBar: View {
     @ObservedObject var menu: MenuModel
+    @ObservedObject var app: AppModel
     let theme: Theme
 
     var body: some View {
@@ -125,19 +191,25 @@ struct DockBar: View {
                     .background(RoundedRectangle(cornerRadius: 14).fill(theme.card))
                     .transition(.opacity)
             }
-            HStack(spacing: 4) {
+            HStack(spacing: 2) {
                 quickChip
                 Rectangle().fill(theme.div).frame(width: 1, height: 44)
+                DockTile(menu: menu, theme: theme, id: "b:browser", label: "Navegador", icon: "safari.fill",
+                         grad: 6, active: menu.window == .browser && menu.stack.isEmpty)
+                DockTile(menu: menu, theme: theme, id: "b:files", label: "Arquivos", icon: "folder.fill",
+                         grad: 3, active: menu.stack.first == .files || (menu.window == .viewer && menu.stack.isEmpty))
+                DockTile(menu: menu, theme: theme, id: "b:apps", label: "Apps", icon: "square.grid.2x2.fill",
+                         grad: 4, active: menu.stack.first == .library)
+                DockTile(menu: menu, theme: theme, id: "b:share", label: "Capturar", icon: "camera.fill",
+                         grad: 7, active: menu.stack.first == .share)
                 DockTile(menu: menu, theme: theme, id: "b:envs", label: "Ambientes", icon: "mountain.2.fill",
                          grad: 2, active: menu.stack.first == .environments)
                 DockTile(menu: menu, theme: theme, id: "b:settings", label: "Config.", icon: "gearshape.fill",
                          grad: 5, active: isSettingsOpen)
-                DockTile(menu: menu, theme: theme, id: "b:about", label: "Sobre", icon: "info.circle.fill",
-                         grad: 8, active: menu.stack.first == .about)
                 DockTile(menu: menu, theme: theme, id: "b:toggle", label: "Fechar", icon: "xmark",
                          grad: nil, active: false)
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 6)
             .padding(.vertical, 10)
             .background(RoundedRectangle(cornerRadius: 24).fill(theme.panel.opacity(0.96)))
             .target("p:dock")
@@ -165,9 +237,10 @@ struct DockBar: View {
                 .font(.system(size: 15))
                 .foregroundColor(theme.text)
             }
-            .frame(width: 84, height: 62)
+            .frame(width: 58, height: 62)
             .background(RoundedRectangle(cornerRadius: 12).fill(menu.stack.first == .quick ? theme.hover : Color.clear))
             .hoverFX(menu, "b:quick", theme, 12)
+            .overlay(NotifDot(notifs: app.notifs, color: theme.accent).offset(x: 24, y: -22))
         }
         .buttonStyle(PlainButtonStyle())
         .target("b:quick")
@@ -189,21 +262,22 @@ struct DockTile: View {
                 ZStack {
                     RoundedRectangle(cornerRadius: 14)
                         .fill(fillStyle)
-                        .frame(width: 48, height: 48)
+                        .frame(width: 36, height: 36)
                     Image(systemName: icon)
-                        .font(.system(size: 22, weight: .medium))
+                        .font(.system(size: 17, weight: .medium))
                         .foregroundColor(grad == nil ? theme.text : .white)
                 }
-                .hoverFX(menu, id, theme, 14)
+                .hoverFX(menu, id, theme, 12)
                 Text(label)
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.system(size: 9, weight: .medium))
                     .foregroundColor(theme.sub)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.7)
                 Capsule()
                     .fill(active ? theme.text : Color.clear)
                     .frame(width: 16, height: 3)
             }
-            .frame(width: 58)
+            .frame(maxWidth: .infinity)
         }
         .buttonStyle(PlainButtonStyle())
         .target(id)
@@ -627,6 +701,12 @@ struct PageContent: View {
         case .access: AccessPage(menu: menu, theme: theme)
         case .storage: StoragePage(menu: menu, theme: theme)
         case .about: AboutPage(menu: menu, app: app, tracker: app.tracker, theme: theme)
+        case .files: FilesPage(menu: menu, media: app.media, theme: theme)
+        case .share: SharePage(menu: menu, capture: app.capture, media: app.media, theme: theme)
+        case .notifs: NotifsPage(menu: menu, notifs: app.notifs, theme: theme)
+        case .profile: ProfilePage(menu: menu, theme: theme)
+        case .privacy: PrivacyPage(menu: menu, theme: theme)
+        case .library: LibraryPage(menu: menu, browser: app.browser, theme: theme)
         }
     }
 }
@@ -642,10 +722,29 @@ struct QuickPage: View {
         let s = menu.ts
         return VStack(spacing: 10) {
             HStack(spacing: 8) {
+                Button(action: { menu.activate("s:b:card:profile") }) {
+                    AvatarView(menu: menu, theme: theme, size: 34)
+                        .overlay(Circle().fill(menu.hoverId == "s:b:card:profile" ? theme.hover : Color.clear))
+                }
+                .buttonStyle(PlainButtonStyle())
+                .target("s:b:card:profile")
                 Image(systemName: menu.batterySymbol).font(.system(size: 18))
                 Text(menu.batteryText).font(.system(size: 15 * s))
                 Spacer()
                 Text(menu.dateText).font(.system(size: 15 * s))
+                Button(action: { menu.activate("s:b:card:notifs") }) {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "bell.fill")
+                            .font(.system(size: 17))
+                            .foregroundColor(theme.text)
+                            .frame(width: 38, height: 38)
+                            .background(Circle().fill(theme.card))
+                            .overlay(Circle().fill(menu.hoverId == "s:b:card:notifs" ? theme.hover : Color.clear))
+                        NotifDot(notifs: app.notifs, color: theme.accent)
+                    }
+                }
+                .buttonStyle(PlainButtonStyle())
+                .target("s:b:card:notifs")
             }
             .foregroundColor(theme.text)
             .padding(.horizontal, 4)
@@ -673,7 +772,13 @@ struct QuickPage: View {
                            title: "Rastrear mãos", isOn: menu.handTracking)
                 IconToggle(menu: menu, theme: theme, action: "b:tog:gyro", icon: "rotate.3d",
                            title: "Giroscópio", isOn: app.gyroEnabled)
+                IconToggle(menu: menu, theme: theme, action: "b:tog:passthrough", icon: "camera.viewfinder",
+                           title: "Passthrough", isOn: menu.passthrough)
+                IconToggle(menu: menu, theme: theme, action: "b:tog:vr", icon: "eyeglasses",
+                           title: "Modo VR", isOn: app.vrMode)
             }
+            InfoTile(menu: menu, theme: theme, action: "b:cast", icon: "airplayvideo",
+                     title: "Transmitir", subtitle: app.cast.active ? "Tela sendo transmitida" : "Central de Controle > Espelhar tela")
 
             ActionRow(menu: menu, theme: theme, action: "b:settings", title: "Configurações",
                       subtitle: "", icon: "gearshape.fill")
@@ -697,6 +802,12 @@ struct SettingsPage: View {
                      title: "Acessibilidade", subtitle: "Tamanho do texto")
             InfoTile(menu: menu, theme: theme, action: "b:card:storage", icon: "internaldrive.fill",
                      title: "Armazenamento", subtitle: menu.storageText)
+            InfoTile(menu: menu, theme: theme, action: "b:card:profile", icon: "person.crop.circle.fill",
+                     title: "Perfil", subtitle: "Nome e foto")
+            InfoTile(menu: menu, theme: theme, action: "b:card:notifs", icon: "bell.fill",
+                     title: "Notificações", subtitle: "Avisos do app")
+            InfoTile(menu: menu, theme: theme, action: "b:card:privacy", icon: "lock.shield.fill",
+                     title: "Privacidade", subtitle: "Permissões e navegador")
             InfoTile(menu: menu, theme: theme, action: "b:card:about", icon: "info.circle.fill",
                      title: "Sobre", subtitle: "Versão e diagnóstico")
         }
@@ -828,16 +939,32 @@ struct HandsPage: View {
         return VStack(spacing: 10) {
             SectionTitle(text: "Mãos", theme: theme, scale: s)
             ToggleRow(menu: menu, theme: theme, action: "b:tog:hands", title: "Rastreio de mãos",
-                      subtitle: "Usa a câmera frontal para detectar suas mãos", isOn: menu.handTracking)
+                      subtitle: "Usa a câmera escolhida abaixo para detectar suas mãos", isOn: menu.handTracking)
             ToggleRow(menu: menu, theme: theme, action: "b:tog:camera", title: "Mostrar a câmera",
                       subtitle: "Miniatura da câmera no canto da tela", isOn: app.showCamera)
             InfoRow(theme: theme, scale: s, title: "Estado", value: tracker.status)
+            CameraVRSection(menu: menu, app: app, tracker: tracker, theme: theme)
             SectionTitle(text: "Movimento", theme: theme, scale: s)
             ToggleRow(menu: menu, theme: theme, action: "b:tog:gyro", title: "Giroscópio",
                       subtitle: "Gira a vista junto com o aparelho", isOn: app.gyroEnabled)
             ActionRow(menu: menu, theme: theme, action: "b:reset", title: "Centralizar vista",
                       subtitle: "", icon: "scope")
+            ToggleRow(menu: menu, theme: theme, action: "b:tog:passthrough", title: "Passthrough",
+                      subtitle: "Mostra a câmera escolhida no lugar do ambiente", isOn: menu.passthrough)
+            SectionTitle(text: "Controles", theme: theme, scale: s)
+            if app.controllers.list.isEmpty {
+                InfoRow(theme: theme, scale: s, title: "Nenhum controle", value: "Conecte um Xbox, PlayStation ou MFi")
+            }
+            ForEach(app.controllers.list) { c in
+                InfoRow(theme: theme, scale: s, title: c.name,
+                        value: c.battery.map { "Bateria \($0)%" + (c.charging ? " (carregando)" : "") } ?? "Conectado")
+            }
+            Text("Analógico direito gira a vista, Menu abre o menu, B volta e Y centraliza.")
+                .font(.system(size: 11 * s))
+                .foregroundColor(theme.sub)
+                .multilineTextAlignment(.center)
         }
+        .onAppear { app.controllers.refresh() }
     }
 }
 
@@ -863,6 +990,8 @@ struct StoragePage: View {
     var body: some View {
         VStack(spacing: 10) {
             InfoRow(theme: theme, scale: menu.ts, title: "Espaço", value: menu.storageText)
+            ActionRow(menu: menu, theme: theme, action: "b:card:files", title: "Arquivos do app",
+                      subtitle: "Capturas, importados e downloads", icon: "folder.fill")
         }
     }
 }
@@ -925,5 +1054,59 @@ struct NightOverlay: View {
             }
         }
         .allowsHitTesting(false)
+    }
+}
+
+// MARK: - modo VR
+
+/// Botão para sair do modo VR (aparece nos dois olhos; a pinça acerta o da esquerda).
+struct VRExitPill: View {
+    @ObservedObject var menu: MenuModel
+    let theme: Theme
+
+    var body: some View {
+        let id = "b:tog:vr"
+        return Button(action: { menu.activate(id) }) {
+            HStack(spacing: 6) {
+                Image(systemName: "xmark.circle.fill")
+                Text("Sair do VR")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundColor(Color.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(Color.black.opacity(0.55)))
+            .overlay(Capsule().fill(menu.hoverId == id ? theme.hover : Color.clear))
+        }
+        .buttonStyle(PlainButtonStyle())
+        .target(id)
+    }
+}
+
+/// Escolha da câmera do rastreamento e opções do modo VR (dentro de Mãos e Controles).
+struct CameraVRSection: View {
+    @ObservedObject var menu: MenuModel
+    @ObservedObject var app: AppModel
+    @ObservedObject var tracker: HandTracker
+    let theme: Theme
+
+    var body: some View {
+        let s = menu.ts
+        return VStack(spacing: 10) {
+            SectionTitle(text: "Câmera do rastreamento", theme: theme, scale: s)
+            ForEach(HandCamera.available, id: \.self) { cam in
+                ToggleRow(menu: menu, theme: theme, action: "b:cam:" + cam.rawValue, title: cam.title,
+                          subtitle: cam.detail, isOn: tracker.camera == cam)
+            }
+            SectionTitle(text: "Modo VR (VR Box / Shinecon)", theme: theme, scale: s)
+            ToggleRow(menu: menu, theme: theme, action: "b:tog:vr", title: "Entrar no modo VR",
+                      subtitle: "Tela dividida em dois olhos, em paisagem", isOn: app.vrMode)
+            ToggleRow(menu: menu, theme: theme, action: "b:tog:vrflip", title: "Inverter orientação",
+                      subtitle: "Use se a imagem aparecer de cabeça para baixo no VR Box", isOn: app.vrFlip)
+            ChoiceRow(menu: menu, theme: theme, title: "Separação das imagens (+ aproxima)",
+                      options: [("b:vrsep:0", "−2"), ("b:vrsep:1", "−1"), ("b:vrsep:2", "0"),
+                                ("b:vrsep:3", "+1"), ("b:vrsep:4", "+2")],
+                      selected: menu.vrShiftIdx)
+        }
     }
 }

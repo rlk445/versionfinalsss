@@ -10,11 +10,24 @@ final class PreviewView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        let o = window?.windowScene?.interfaceOrientation ?? .portrait
         if let c = previewLayer.connection {
             if #available(iOS 17.0, *) {
-                if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
+                var angle: CGFloat = 90
+                switch o {
+                case .landscapeRight: angle = 0
+                case .landscapeLeft: angle = 180
+                case .portraitUpsideDown: angle = 270
+                default: angle = 90
+                }
+                if c.isVideoRotationAngleSupported(angle) { c.videoRotationAngle = angle }
             } else if c.isVideoOrientationSupported {
-                c.videoOrientation = .portrait
+                switch o {
+                case .landscapeRight: c.videoOrientation = .landscapeRight
+                case .landscapeLeft: c.videoOrientation = .landscapeLeft
+                case .portraitUpsideDown: c.videoOrientation = .portraitUpsideDown
+                default: c.videoOrientation = .portrait
+                }
             }
         }
     }

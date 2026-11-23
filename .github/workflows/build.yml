@@ -11,6 +11,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Conferir arquivos do projeto
+        run: |
+          echo "== Sources =="; ls Sources
+          echo "== Ambientes =="
+          missing=0
+          for d in desert winterlodge bubbles ryokan dome spacestation cybercity; do
+            if [ -f "Resources/$d/scene.bin" ]; then
+              echo "OK   $d ($(ls Resources/$d | wc -l) arquivos)"
+            else
+              echo "FALTA Resources/$d/scene.bin"; missing=1
+            fi
+          done
+          grep -q "handsdf_fragment" Sources/Shaders.metal && echo "OK   mao translucida (shader)" || { echo "FALTA shader da mao nova"; missing=1; }
+          grep -q "VRButton" Sources/ContentView.swift && echo "OK   botao modo VR" || { echo "FALTA botao VR"; missing=1; }
+          if [ "$missing" = "1" ]; then
+            echo "::error::Faltam arquivos no repositorio. Envie TODA a pasta (Sources, Resources, project.yml...)."
+            exit 1
+          fi
+
       - name: Baixar modelo de mãos do MediaPipe
         run: |
           curl -L --fail -o Resources/hand_landmarker.task \
@@ -35,6 +54,7 @@ jobs:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -archivePath "$PWD/build/Metulas.xcarchive" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             archive
 
@@ -42,9 +62,13 @@ jobs:
         run: |
           mkdir -p Payload
           cp -R build/Metulas.xcarchive/Products/Applications/Metulas.app Payload/
-          zip -qry Metulas.ipa Payload
+          echo "== scene.bin dentro do app =="
+          find Payload -name scene.bin | sort
+          test "$(find Payload -name scene.bin | wc -l | tr -d ' ')" = "7" || { echo "::error::O app nao contem os 7 ambientes"; exit 1; }
+          zip -qry Metulas-build-${{ github.run_number }}.ipa Payload
+          ls -la *.ipa
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Metulas-ipa
-          path: Metulas.ipa
+          name: Metulas-ipa-build-${{ github.run_number }}
+          path: Metulas-build-${{ github.run_number }}.ipa

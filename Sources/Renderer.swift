@@ -1,4 +1,5 @@
 import MetalKit
+import UIKit
 import simd
 import QuartzCore
 
@@ -15,6 +16,13 @@ struct HandVertex {
     var color: SIMD4<Float>
 }
 
+/// Uma "tela" de renderização: a tela inteira (modo normal) ou um olho (modo VR).
+private struct EyeRect {
+    var viewport: MTLViewport
+    var scissor: MTLScissorRect
+    var side: Float          // -1 olho esquerdo, +1 olho direito, 0 normal
+}
+
 private let boneLinks: [(Int, Int)] = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -29,10 +37,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let queue: MTLCommandQueue
     private let model: AppModel
     private var scene: LoadedScene
+    private var animator: SceneAnimator?
+    private var lastFrameTime: CFTimeInterval = 0
     private var textures: [MTLTexture?] = []
     private let fallback: MTLTexture
     private let psoScene: MTLRenderPipelineState
     private let psoHand: MTLRenderPipelineState
+    private let psoHandSDF: MTLRenderPipelineState
     private let dsScene: MTLDepthStencilState
     private let dsOff: MTLDepthStencilState
     private let sampler: MTLSamplerState
@@ -51,6 +62,27 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private(set) var currentEnv = "desert"
     private var switching = false
+    private var snapshotHandler: ((UIImage?) -> Void)?
+
+    /// Pede uma foto do próximo quadro (cena + mãos, sem o menu).
+    func requestSnapshot(_ handler: @escaping (UIImage?) -> Void) {
+        snapshotHandler = handler
+    }
+
+    private func image(from tex: MTLTexture) -> UIImage? {
+        let w = tex.width
+        let h = tex.height
+        let bpr = w * 4
+        var bytes = [UInt8](repeating: 0, count: bpr * h)
+        tex.getBytes(&bytes, bytesPerRow: bpr, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        let info = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bpr,
+                               space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: info),
+                               provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { return nil }
+        return UIImage(cgImage: cg)
+    }
 
     static var lastError = ""
     var summary: String {
@@ -74,6 +106,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         view.sampleCount = 4
         view.clearColor = MTLClearColor(red: 0.62, green: 0.74, blue: 0.9, alpha: 1)
         view.preferredFramesPerSecond = 60
+        view.framebufferOnly = false   // permite ler o quadro para tirar foto
+        view.isOpaque = false          // deixa o passthrough (câmera) aparecer por trás
 
         // ambiente salvo no menu; se não estiver incluído no app, usa o primeiro disponível
         var envId = model.menu.homeEnv
@@ -133,6 +167,26 @@ final class Renderer: NSObject, MTKViewDelegate {
             return nil
         }
 
+        let sdfDesc = MTLRenderPipelineDescriptor()
+        sdfDesc.vertexFunction = library.makeFunction(name: "handsdf_vertex")
+        sdfDesc.fragmentFunction = library.makeFunction(name: "handsdf_fragment")
+        sdfDesc.rasterSampleCount = view.sampleCount
+        sdfDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+        let sa = sdfDesc.colorAttachments[0]!
+        sa.pixelFormat = view.colorPixelFormat
+        sa.isBlendingEnabled = true
+        sa.rgbBlendOperation = .add
+        sa.alphaBlendOperation = .add
+        sa.sourceRGBBlendFactor = .sourceAlpha
+        sa.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        sa.sourceAlphaBlendFactor = .one
+        sa.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let sdfState: MTLRenderPipelineState
+        do { sdfState = try dev.makeRenderPipelineState(descriptor: sdfDesc) } catch {
+            Renderer.lastError = "pipeline mao sdf: \(error.localizedDescription)"
+            return nil
+        }
+
         let d1 = MTLDepthStencilDescriptor()
         d1.depthCompareFunction = .less
         d1.isDepthWriteEnabled = true
@@ -166,11 +220,13 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.fallback = fb
         self.psoScene = sceneState
         self.psoHand = handState
+        self.psoHandSDF = sdfState
         self.dsScene = ds1
         self.dsOff = ds2
         self.sampler = samp
         super.init()
         self.currentEnv = envId
+        self.animator = SceneAnimator(scene: loaded, device: dev)
     }
 
     private static func loadTextures(_ names: [String], env: String, device: MTLDevice) -> [MTLTexture?] {
@@ -201,9 +257,11 @@ final class Renderer: NSObject, MTKViewDelegate {
             do {
                 let loaded = try SceneLoader.load(device: dev, name: id)
                 let texs = Renderer.loadTextures(loaded.textureNames, env: id, device: dev)
+                let anim = SceneAnimator(scene: loaded, device: dev)
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     self.scene = loaded
+                    self.animator = anim
                     self.textures = texs
                     self.currentEnv = id
                     self.switching = false
@@ -232,16 +290,19 @@ final class Renderer: NSObject, MTKViewDelegate {
         model.motion.recenter()
     }
 
-    /// Converte um ponto normalizado da câmera (0...1) para pontos de tela,
-    /// com a mesma projeção usada para desenhar o esqueleto da mão.
-    private func screenPoint(_ n: SIMD2<Float>, size: CGSize) -> CGPoint {
-        let asp = Float(size.width / max(size.height, 1))
-        let x = (0.5 + (n.x - 0.5) * cameraAspect / asp) * Float(size.width)
-        let y = n.y * Float(size.height)
-        return CGPoint(x: CGFloat(x), y: CGFloat(y))
+    /// Converte um ponto normalizado da câmera (0...1) para um retângulo w x h
+    /// (a imagem da câmera preenche o retângulo, cortando o que sobra).
+    private func mapToRect(_ n: SIMD2<Float>, width w: Float, height h: Float) -> SIMD2<Float> {
+        let ca = max(cameraAspect, 0.1)
+        let s = max(w / ca, h)
+        let x = w * 0.5 + (n.x - 0.5) * ca * s
+        let y = h * 0.5 + (n.y - 0.5) * s
+        return SIMD2<Float>(x, y)
     }
 
-    private func updateInteraction(_ hands: [TrackedHand], size: CGSize) {
+    /// `eyeSize` = tamanho de um olho (ou da tela) em pontos; `shift` = deslocamento do olho esquerdo em pontos.
+    /// Os cursores recebem coordenadas locais do olho; o teste de toque usa as globais (local + shift).
+    private func updateInteraction(_ hands: [TrackedHand], eyeSize: CGSize, shift: CGFloat) {
         let menu = model.menu
         var seen = Set<String>()
         var dots: [PointerDot] = []
@@ -250,9 +311,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         for h in hands {
             seen.insert(h.label)
             let was = pinchWas[h.label] ?? false
-            let pt = screenPoint(h.pinchPoint, size: size)
+            let m = mapToRect(h.pinchPoint, width: Float(eyeSize.width), height: Float(eyeSize.height))
+            let local = CGPoint(x: CGFloat(m.x), y: CGFloat(m.y))
+            let pt = CGPoint(x: local.x + shift, y: local.y)
             let prevPt = pointerPrev[h.label] ?? pt
-            dots.append(PointerDot(id: h.label, point: pt, pinching: h.pinching))
+            dots.append(PointerDot(id: h.label, point: local, pinching: h.pinching))
             if !h.pinching && hoverPoint == nil { hoverPoint = pt }
 
             if h.pinching {
@@ -304,67 +367,46 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
     }
 
-    // MARK: - mãos no espaço da câmera
+    // MARK: - mãos (silhueta translúcida, desenhada pelo shader handsdf_*)
 
-    private func handViewPoint(_ l: SIMD3<Float>) -> SIMD3<Float> {
-        let d: Float = 0.45
-        let s = 2 * d * tan(fovY * 0.5)
-        let x = (l.x - 0.5) * cameraAspect * s
-        let y = (0.5 - l.y) * s
-        let z = -d - l.z * cameraAspect * s
-        return SIMD3<Float>(x, y, z)
-    }
-
-    private func quad(_ out: inout [HandVertex], center c: SIMD3<Float>, half r: Float, color: SIMD4<Float>) {
-        let a = SIMD4<Float>(c.x - r, c.y - r, c.z, 1)
-        let b = SIMD4<Float>(c.x + r, c.y - r, c.z, 1)
-        let cc = SIMD4<Float>(c.x + r, c.y + r, c.z, 1)
-        let d = SIMD4<Float>(c.x - r, c.y + r, c.z, 1)
-        out.append(HandVertex(position: a, color: color))
-        out.append(HandVertex(position: b, color: color))
-        out.append(HandVertex(position: cc, color: color))
-        out.append(HandVertex(position: a, color: color))
-        out.append(HandVertex(position: cc, color: color))
-        out.append(HandVertex(position: d, color: color))
-    }
-
-    private func bone(_ out: inout [HandVertex], from a: SIMD3<Float>, to b: SIMD3<Float>, width w: Float, color: SIMD4<Float>) {
-        let dx = b.x - a.x
-        let dy = b.y - a.y
-        let len = sqrt(dx * dx + dy * dy)
-        if len < 1e-5 { return }
-        let px = -dy / len * w
-        let py = dx / len * w
-        let p0 = SIMD4<Float>(a.x + px, a.y + py, a.z, 1)
-        let p1 = SIMD4<Float>(a.x - px, a.y - py, a.z, 1)
-        let p2 = SIMD4<Float>(b.x - px, b.y - py, b.z, 1)
-        let p3 = SIMD4<Float>(b.x + px, b.y + py, b.z, 1)
-        out.append(HandVertex(position: p0, color: color))
-        out.append(HandVertex(position: p1, color: color))
-        out.append(HandVertex(position: p2, color: color))
-        out.append(HandVertex(position: p0, color: color))
-        out.append(HandVertex(position: p2, color: color))
-        out.append(HandVertex(position: p3, color: color))
-    }
-
-    private func buildHandVertices(_ hands: [TrackedHand]) -> [HandVertex] {
-        var out: [HandVertex] = []
-        out.reserveCapacity(hands.count * 260)
-        for h in hands {
-            let base: SIMD4<Float> = h.label == "Left"
-                ? SIMD4<Float>(0.25, 0.85, 1.0, 0.9)
-                : SIMD4<Float>(1.0, 0.45, 0.85, 0.9)
-            let joint: SIMD4<Float> = h.pinching ? SIMD4<Float>(1.0, 0.85, 0.2, 1.0) : SIMD4<Float>(1, 1, 1, 1)
-            let pts = h.points.map { handViewPoint($0) }
-            for (a, b) in boneLinks {
-                bone(&out, from: pts[a], to: pts[b], width: 0.0022, color: base)
+    /// Dados da mão para um olho: tudo em pixels do quadro (ver Shaders.metal).
+    private func buildHandData(_ hands: [TrackedHand], viewport vp: MTLViewport) -> [SIMD4<Float>] {
+        var data = [SIMD4<Float>](repeating: SIMD4<Float>(0, 0, 0, 0), count: 50)
+        let w = Float(vp.width)
+        let h = Float(vp.height)
+        let ox = Float(vp.originX)
+        let oy = Float(vp.originY)
+        data[0] = SIMD4<Float>(ox, oy, w, h)
+        var count: Float = 0
+        var hi = 0
+        for hand in hands {
+            if hi >= 2 { break }
+            if hand.points.count < 21 { continue }
+            let base = 2 + hi * 24
+            var pix: [SIMD2<Float>] = []
+            var minX = Float.greatestFiniteMagnitude
+            var minY = Float.greatestFiniteMagnitude
+            var maxX = -Float.greatestFiniteMagnitude
+            var maxY = -Float.greatestFiniteMagnitude
+            for k in 0..<21 {
+                let m = mapToRect(SIMD2<Float>(hand.points[k].x, hand.points[k].y), width: w, height: h)
+                let q = SIMD2<Float>(m.x + ox, m.y + oy)
+                pix.append(q)
+                data[base + k] = SIMD4<Float>(q.x, q.y, 0, 0)
+                minX = min(minX, q.x)
+                minY = min(minY, q.y)
+                maxX = max(maxX, q.x)
+                maxY = max(maxY, q.y)
             }
-            for (i, p) in pts.enumerated() {
-                let tip = (i == 4 || i == 8 || i == 12 || i == 16 || i == 20)
-                quad(&out, center: p, half: tip ? 0.0048 : 0.0033, color: joint)
-            }
+            let palm = max(distance(pix[0], pix[9]), 8)
+            data[base + 21] = SIMD4<Float>(hand.pinching ? 1 : 0, palm, 0, 0)
+            let pad = palm * 1.8
+            data[base + 22] = SIMD4<Float>(minX - pad, minY - pad, maxX + pad, maxY + pad)
+            hi += 1
+            count += 1
         }
-        return out
+        data[1] = SIMD4<Float>(count, 0, 0, 0)
+        return data
     }
 
     // MARK: - MTKViewDelegate
@@ -376,67 +418,142 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        let passthrough = model.menu.passthrough
+        let vr = model.vrMode
+
+        // orientação atual da interface (retrato / paisagem do modo VR)
+        if let o = view.window?.windowScene?.interfaceOrientation {
+            model.motion.interfaceOrientation = o
+            model.tracker.setInterfaceOrientation(o)
+        }
+
+        if passthrough {
+            view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        } else if vr {
+            view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        } else {
+            view.clearColor = MTLClearColor(red: 0.62, green: 0.74, blue: 0.9, alpha: 1)
+        }
         guard let rpd = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable,
               let cb = queue.makeCommandBuffer() else { return }
 
-        if view.drawableSize.height > 0 {
-            aspect = Float(view.drawableSize.width / view.drawableSize.height)
+        let dw = Float(view.drawableSize.width)
+        let dh = Float(view.drawableSize.height)
+        if dh > 0 { aspect = dw / dh }
+
+        // um "olho" no modo normal, dois no modo VR
+        var eyes: [EyeRect] = []
+        var eyeSizePts = view.bounds.size
+        var shiftPts: CGFloat = 0
+        if vr && dw > 4 {
+            let half = dw * 0.5
+            let sh = model.menu.vrShiftFraction * dw
+            let scaleX = Float(view.bounds.size.width) / max(dw, 1)
+            shiftPts = CGFloat(sh * scaleX)
+            eyeSizePts = CGSize(width: view.bounds.size.width * 0.5, height: view.bounds.size.height)
+            eyes.append(EyeRect(
+                viewport: MTLViewport(originX: Double(sh), originY: 0, width: Double(half), height: Double(dh), znear: 0, zfar: 1),
+                scissor: MTLScissorRect(x: 0, y: 0, width: Int(half), height: Int(dh)),
+                side: -1))
+            eyes.append(EyeRect(
+                viewport: MTLViewport(originX: Double(half - sh), originY: 0, width: Double(half), height: Double(dh), znear: 0, zfar: 1),
+                scissor: MTLScissorRect(x: Int(half), y: 0, width: Int(dw) - Int(half), height: Int(dh)),
+                side: 1))
+        } else {
+            eyes.append(EyeRect(
+                viewport: MTLViewport(originX: 0, originY: 0, width: Double(dw), height: Double(dh), znear: 0, zfar: 1),
+                scissor: MTLScissorRect(x: 0, y: 0, width: Int(dw), height: Int(dh)),
+                side: 0))
         }
 
         let hands = model.tracker.currentHands()
-        updateInteraction(hands, size: view.bounds.size)
+        updateInteraction(hands, eyeSize: eyeSizePts, shift: shiftPts)
+
+        // controle (GameController): analógico direito gira a vista
+        let now = CACurrentMediaTime()
+        let dt = Float(min(max(now - lastFrameTime, 0), 0.1))
+        lastFrameTime = now
+        let stick = model.controllers.stick
+        if abs(stick.x) > 0.01 || abs(stick.y) > 0.01 {
+            addLook(yaw: -stick.x * 1.8 * dt, pitch: stick.y * 1.3 * dt)
+        }
+        if !passthrough { animator?.update(time: now) }
 
         let camRot = rotationY(yawOffset) * model.motion.rotation() * rotationX(pitchOffset)
-        let viewM = simd_float4x4(rotation: camRot.transpose) * simd_float4x4.translation(-eye)
-        let proj = simd_float4x4.perspective(fovY: fovY, aspect: aspect, near: 0.05, far: 4000)
+        let rightDir = camRot * SIMD3<Float>(1, 0, 0)
+        let halfIPD: Float = 0.032
 
         guard let enc = cb.makeRenderCommandEncoder(descriptor: rpd) else { return }
         enc.setCullMode(.none)
 
-        // cena
-        enc.setRenderPipelineState(psoScene)
-        enc.setDepthStencilState(dsScene)
-        var fu = FrameUniforms(viewProj: proj * viewM)
-        enc.setVertexBytes(&fu, length: MemoryLayout<FrameUniforms>.stride, index: 1)
-        enc.setFragmentSamplerState(sampler, index: 0)
+        for e in eyes {
+            enc.setViewport(e.viewport)
+            enc.setScissorRect(e.scissor)
 
-        for d in scene.draws {
-            let mesh = scene.meshes[d.mesh]
-            var du = DrawUniforms(model: d.world)
-            enc.setVertexBytes(&du, length: MemoryLayout<DrawUniforms>.stride, index: 2)
-            enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
-            var tex: MTLTexture = fallback
-            if mesh.material >= 0 && mesh.material < scene.materials.count {
-                let ti = scene.materials[mesh.material].texture
-                if ti >= 0 && ti < textures.count, let t = textures[ti] {
-                    tex = t
+            let eyePos = eye + rightDir * (e.side * halfIPD)
+            let viewM = simd_float4x4(rotation: camRot.transpose) * simd_float4x4.translation(-eyePos)
+            let eyeAspect = Float(e.viewport.width / max(e.viewport.height, 1))
+            let proj = simd_float4x4.perspective(fovY: fovY, aspect: eyeAspect, near: 0.05, far: 4000)
+
+            // cena
+            enc.setRenderPipelineState(psoScene)
+            enc.setDepthStencilState(dsScene)
+            var fu = FrameUniforms(viewProj: proj * viewM)
+            enc.setVertexBytes(&fu, length: MemoryLayout<FrameUniforms>.stride, index: 1)
+            enc.setFragmentSamplerState(sampler, index: 0)
+
+            for (di, d) in scene.draws.enumerated() {
+                if passthrough { break }   // passthrough: só câmera + mãos + menu
+                let mesh = scene.meshes[d.mesh]
+                var modelM = d.world
+                var vbuf = mesh.vertexBuffer
+                if let a = animator {
+                    if let sb = a.skinnedBuffer(forDraw: di) {
+                        vbuf = sb
+                        modelM = matrix_identity_float4x4
+                    } else if d.node >= 0 && d.node < a.world.count {
+                        modelM = a.world[d.node]
+                    }
                 }
+                var du = DrawUniforms(model: modelM)
+                enc.setVertexBytes(&du, length: MemoryLayout<DrawUniforms>.stride, index: 2)
+                enc.setVertexBuffer(vbuf, offset: 0, index: 0)
+                var tex: MTLTexture = fallback
+                if mesh.material >= 0 && mesh.material < scene.materials.count {
+                    let ti = scene.materials[mesh.material].texture
+                    if ti >= 0 && ti < textures.count, let t = textures[ti] {
+                        tex = t
+                    }
+                }
+                enc.setFragmentTexture(tex, index: 0)
+                enc.drawIndexedPrimitives(type: .triangle,
+                                          indexCount: mesh.indexCount,
+                                          indexType: .uint32,
+                                          indexBuffer: mesh.indexBuffer,
+                                          indexBufferOffset: 0)
             }
-            enc.setFragmentTexture(tex, index: 0)
-            enc.drawIndexedPrimitives(type: .triangle,
-                                      indexCount: mesh.indexCount,
-                                      indexType: .uint32,
-                                      indexBuffer: mesh.indexBuffer,
-                                      indexBufferOffset: 0)
-        }
 
-        // mãos
-        let hv = buildHandVertices(hands)
-        if !hv.isEmpty {
-            let length = hv.count * MemoryLayout<HandVertex>.stride
-            if let buf = device.makeBuffer(bytes: hv, length: length, options: .storageModeShared) {
-                enc.setRenderPipelineState(psoHand)
+            // mãos translúcidas (por cima de tudo)
+            if !hands.isEmpty {
+                var hd = buildHandData(hands, viewport: e.viewport)
+                enc.setRenderPipelineState(psoHandSDF)
                 enc.setDepthStencilState(dsOff)
-                var hp = proj
-                enc.setVertexBuffer(buf, offset: 0, index: 0)
-                enc.setVertexBytes(&hp, length: MemoryLayout<simd_float4x4>.stride, index: 1)
-                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: hv.count)
+                enc.setFragmentBytes(&hd, length: hd.count * MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
         }
 
         enc.endEncoding()
         cb.present(drawable)
+        if let snap = snapshotHandler {
+            snapshotHandler = nil
+            let tex = drawable.texture
+            cb.addCompletedHandler { [weak self] _ in
+                let img = self?.image(from: tex)
+                DispatchQueue.main.async { snap(img) }
+            }
+        }
         cb.addCompletedHandler { [weak self] c in
             if let e = c.error {
                 DispatchQueue.main.async { self?.model.renderInfo = "GPU erro: \(e.localizedDescription)" }
