@@ -150,7 +150,7 @@ final class HandTracker: NSObject, ObservableObject {
             let options = HandLandmarkerOptions()
             options.baseOptions.modelAssetPath = modelPath
             options.runningMode = .liveStream
-            options.numHands = 2
+            options.numHands = maxHands
             options.minHandDetectionConfidence = 0.5
             options.minHandPresenceConfidence = 0.5
             options.minTrackingConfidence = 0.5
