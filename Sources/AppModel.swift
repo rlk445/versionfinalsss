@@ -59,6 +59,7 @@ final class AppModel: ObservableObject {
         audio.envSoundsEnabled = menu.envSounds
         audio.volume = Float(menu.volume)
         tracker.handsEnabled = menu.handTracking
+        tracker.setMaxHands(menu.maxHands)
     }
 
     func start() {
