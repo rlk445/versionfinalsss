@@ -65,11 +65,13 @@ struct MenuOverlay: View {
     }
 
     private func panelWidth(_ size: CGSize) -> CGFloat {
-        return vr ? min(size.width - 70, 330) : min(size.width - 20, 380)
+        let base = vr ? min(size.width - 70, 330) : min(size.width - 20, 380)
+        return vr ? base : min(base * menu.panelScale, size.width - 20)
     }
 
     private func panelHeight(_ size: CGSize) -> CGFloat {
-        return vr ? min(size.height * 0.62, 300) : min(size.height * 0.56, 480)
+        let base = vr ? min(size.height * 0.62, 300) : min(size.height * 0.56, 480)
+        return vr ? base : min(base * menu.panelScale, size.height - 80)
     }
 
     private func windowHeight(_ size: CGSize) -> CGFloat {
@@ -87,13 +89,16 @@ struct MenuOverlay: View {
                 if let page = menu.stack.last {
                     MainPanel(menu: menu, app: app, page: page, theme: theme)
                         .frame(width: w, height: panelHeight(size))
+                        .overlay(alignment: .bottomTrailing) { if !vr { ResizeHandle(menu: menu, theme: theme) } }
                         .transition(AnyTransition.scale(scale: 0.94).combined(with: .opacity))
                 } else if menu.window == .browser {
                     BrowserWindow(menu: menu, app: app, browser: browser, kb: keyboard, theme: theme)
                         .frame(width: w, height: windowHeight(size))
+                        .overlay(alignment: .bottomTrailing) { if !vr { ResizeHandle(menu: menu, theme: theme) } }
                 } else if menu.window == .viewer {
                     ViewerWindow(menu: menu, media: app.media, theme: theme)
                         .frame(width: w, height: windowHeight(size))
+                        .overlay(alignment: .bottomTrailing) { if !vr { ResizeHandle(menu: menu, theme: theme) } }
                 }
                 if keyboard.isOpen {
                     KeyboardPanel(menu: menu, kb: keyboard, theme: theme)
@@ -306,6 +311,29 @@ struct GrabHandle: View {
                     .onEnded { _ in menu.endTouchDragMenu() }
             )
             .target("g:grab")
+    }
+}
+
+/// Alça no canto do painel: arrastar (com o dedo na tela ou pinçando) aumenta/diminui o menu, como redimensionar uma janela no PC.
+struct ResizeHandle: View {
+    @ObservedObject var menu: MenuModel
+    let theme: Theme
+
+    var body: some View {
+        let hot = menu.hoverId == "g:resize"
+        return Image(systemName: "arrow.up.left.and.arrow.down.right")
+            .font(.system(size: 12, weight: .bold))
+            .foregroundColor(hot ? theme.text : theme.sub)
+            .frame(width: 30, height: 30)
+            .background(Circle().fill(theme.card.opacity(hot ? 1 : 0.85)))
+            .contentShape(Rectangle().inset(by: -10))
+            .offset(x: -6, y: -6)
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { v in menu.touchResizeMenu(v.translation) }
+                    .onEnded { _ in menu.endTouchResizeMenu() }
+            )
+            .target("g:resize")
     }
 }
 
@@ -940,6 +968,9 @@ struct HandsPage: View {
             SectionTitle(text: "Mãos", theme: theme, scale: s)
             ToggleRow(menu: menu, theme: theme, action: "b:tog:hands", title: "Rastreio de mãos",
                       subtitle: "Usa a câmera escolhida abaixo para detectar suas mãos", isOn: menu.handTracking)
+            ChoiceRow(menu: menu, theme: theme, title: "Número de mãos rastreadas",
+                      options: [("b:hands:1", "1 mão"), ("b:hands:2", "2 mãos")],
+                      selected: menu.maxHands - 1)
             ToggleRow(menu: menu, theme: theme, action: "b:tog:camera", title: "Mostrar a câmera",
                       subtitle: "Miniatura da câmera no canto da tela", isOn: app.showCamera)
             InfoRow(theme: theme, scale: s, title: "Estado", value: tracker.status)
