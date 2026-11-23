@@ -161,7 +161,7 @@ final class BrowserTab: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownload
 final class BrowserModel: ObservableObject {
     @Published var tabs: [BrowserTab] = []
     @Published var current = 0
-    @Published var sub: BrowserSub = .none
+    @Published var sub: BrowserSub = .page
     @Published var theater = false
     @Published var zoomIdx = 1
     @Published var tick = 0
